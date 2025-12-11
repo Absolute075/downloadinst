@@ -11,6 +11,7 @@ import yt_dlp
 import instaloader
 import requests
 from urllib.parse import urlparse
+from dotenv import load_dotenv
 
 # Настройка логирования
 logging.basicConfig(
@@ -19,12 +20,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Загружаем переменные окружения из .env (если файл существует)
+load_dotenv()
+
 # Создаем папку для загрузок
 DOWNLOAD_FOLDER = "downloads"
 Path(DOWNLOAD_FOLDER).mkdir(exist_ok=True)
 
-# Токен вашего бота
-BOT_TOKEN = "8340259591:AAHfhy4UKOwKUvQskP03jR-WJDXz6ZMgwfs"
+# Токен вашего бота читаем из переменной окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set. Please set it in .env or as an environment variable.")
 
 # Инициализация Instaloader для Instagram
 insta = instaloader.Instaloader(
