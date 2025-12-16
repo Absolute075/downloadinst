@@ -4,6 +4,7 @@ import logging
 import tempfile
 import shutil
 from pathlib import Path
+from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
@@ -42,6 +43,59 @@ insta = instaloader.Instaloader(
     save_metadata=False,
     compress_json=False
 )
+
+_INSTA_SETUP_DONE = False
+
+
+def _extract_instagram_shortcode(url: str) -> Optional[str]:
+    match = re.search(r"/(?:reel|p|tv)/([^/?#&]+)", url)
+    return match.group(1) if match else None
+
+
+def _ensure_instaloader_setup() -> None:
+    global _INSTA_SETUP_DONE
+    if _INSTA_SETUP_DONE:
+        return
+
+    _INSTA_SETUP_DONE = True
+
+    proxy = os.getenv("INSTAGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    if proxy:
+        try:
+            insta.context._session.proxies.update({"http": proxy, "https": proxy})
+            logger.info("Instaloader proxy configured")
+        except Exception:
+            logger.exception("Failed to configure Instaloader proxy")
+
+    username = os.getenv("INSTA_USERNAME")
+    password = os.getenv("INSTA_PASSWORD")
+    sessionfile = os.getenv("INSTA_SESSIONFILE")
+
+    if not username:
+        return
+
+    try:
+        if sessionfile and os.path.exists(sessionfile):
+            insta.load_session_from_file(username, sessionfile)
+            logger.info("Instaloader session loaded")
+            return
+    except Exception:
+        logger.exception("Failed to load Instaloader session")
+
+    if not password:
+        return
+
+    try:
+        insta.login(username, password)
+        logger.info("Instaloader login succeeded")
+        if sessionfile:
+            try:
+                insta.save_session_to_file(sessionfile)
+                logger.info("Instaloader session saved")
+            except Exception:
+                logger.exception("Failed to save Instaloader session")
+    except Exception:
+        logger.exception("Instaloader login failed")
 
 
 # ========== КОМАНДЫ БОТА ==========
@@ -177,7 +231,7 @@ def download_tiktok_ytdlp(url: str) -> str:
         'fragment_retries': 5,
         'socket_timeout': 60,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         },
     }
 
@@ -208,12 +262,11 @@ def download_instagram_instaloader(url: str) -> str:
     """Скачивание Instagram видео через Instaloader"""
     temp_dir = None
     try:
-        # Извлекаем shortcode из URL
-        shortcode_match = re.search(r'/reel/([^/?]+)|/p/([^/?]+)', url)
-        if not shortcode_match:
-            return None
+        _ensure_instaloader_setup()
 
-        shortcode = shortcode_match.group(1) or shortcode_match.group(2)
+        shortcode = _extract_instagram_shortcode(url)
+        if not shortcode:
+            return None
 
         # Создаем временную папку
         temp_dir = tempfile.mkdtemp()
@@ -221,8 +274,7 @@ def download_instagram_instaloader(url: str) -> str:
         # Скачиваем пост
         post = instaloader.Post.from_shortcode(insta.context, shortcode)
 
-        # Проверяем, есть ли видео
-        # Скачиваем видео
+        # Скачиваем медиа (видео/фото)
         insta.download_post(post, target=temp_dir)
 
         # Ищем скачанный файл
@@ -247,8 +299,8 @@ def download_instagram_instaloader(url: str) -> str:
 
         return final_path if os.path.exists(final_path) else None
 
-    except Exception as e:
-        logger.error(f"Error downloading Instagram: {e}")
+    except Exception:
+        logger.exception("Error downloading Instagram with Instaloader")
         return None
     finally:
         if temp_dir and os.path.isdir(temp_dir):
@@ -260,6 +312,8 @@ def download_instagram_instaloader(url: str) -> str:
 
 def download_instagram_ytdlp(url: str) -> str:
     """Альтернативный способ для Instagram через yt-dlp"""
+    proxy = os.getenv("INSTAGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    cookies_path = Path(os.getenv("INSTAGRAM_COOKIES_FILE") or "cookies.txt")
     ydl_opts = {
         'format': 'best',
         'outtmpl': f'{DOWNLOAD_FOLDER}/%(title)s.%(ext)s',
@@ -269,8 +323,19 @@ def download_instagram_ytdlp(url: str) -> str:
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
-        }
+        },
+        # Делаем скачивание более устойчивым
+        'socket_timeout': 120,
+        'retries': 5,
+        'fragment_retries': 5,
+        'extractor_retries': 5,
     }
+
+    if proxy:
+        ydl_opts['proxy'] = proxy
+
+    if cookies_path.is_file():
+        ydl_opts['cookiefile'] = str(cookies_path)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -278,38 +343,37 @@ def download_instagram_ytdlp(url: str) -> str:
             filename = ydl.prepare_filename(info)
             return filename if os.path.exists(filename) else None
     except Exception as e:
-        logger.error(f"Error downloading Instagram with yt-dlp: {e}")
+        logger.exception("Error downloading Instagram with yt-dlp")
+        err_str = str(e).lower()
+        if 'cookies' in err_str or 'login' in err_str or 'rate-limit' in err_str:
+            logger.error("Instagram может требовать авторизацию или куки устарели. Обновите cookies.txt.")
         return None
 
 
 def download_video_direct(url: str) -> str:
-    """Прямое скачивание по ссылке (для Stories и т.д.)"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+    """Прямое скачивание видео"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
 
-        response = requests.get(url, headers=headers, stream=True, timeout=30)
-        response.raise_for_status()
+    response = requests.get(url, headers=headers, stream=True, timeout=30)
+    response.raise_for_status()
 
-        # Получаем имя файла из URL или генерируем
-        parsed_url = urlparse(url)
-        filename = parsed_url.path.split('/')[-1] or 'video.mp4'
-        if not filename.endswith('.mp4'):
-            filename += '.mp4'
+    # Получаем имя файла из URL или генерируем
+    parsed_url = urlparse(url)
+    filename = parsed_url.path.split('/')[-1] or 'video.mp4'
+    if not filename.endswith('.mp4'):
+        filename += '.mp4'
 
-        filepath = os.path.join(DOWNLOAD_FOLDER, clean_filename(filename))
+    filepath = os.path.join(DOWNLOAD_FOLDER, clean_filename(filename))
 
-        with open(filepath, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+    with open(filepath, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
 
-        return filepath if os.path.exists(filepath) else None
-
-    except Exception as e:
-        logger.error(f"Error direct download: {e}")
-        return None
+    return filepath if os.path.exists(filepath) else None
 
 
 # ========== ОБРАБОТЧИК СООБЩЕНИЙ ==========
