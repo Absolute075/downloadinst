@@ -1,16 +1,15 @@
 import os
 import re
 import logging
-import tempfile
-import shutil
+
 from pathlib import Path
-from typing import Optional
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 import yt_dlp
-import instaloader
 import requests
+
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
@@ -21,11 +20,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
 # Загружаем переменные окружения из .env (если файл существует)
 load_dotenv()
 
 # Создаем папку для загрузок
-DOWNLOAD_FOLDER = "downloads"
+DOWNLOAD_FOLDER = os.getenv("DOWNLOAD_FOLDER", "downloads")
 Path(DOWNLOAD_FOLDER).mkdir(exist_ok=True)
 
 # Токен вашего бота читаем из переменной окружения
@@ -33,70 +37,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Please set it in .env or as an environment variable.")
-
-# Инициализация Instaloader для Instagram
-insta = instaloader.Instaloader(
-    download_videos=True,
-    download_video_thumbnails=False,
-    download_geotags=False,
-    download_comments=False,
-    save_metadata=False,
-    compress_json=False
-)
-
-_INSTA_SETUP_DONE = False
-
-
-def _extract_instagram_shortcode(url: str) -> Optional[str]:
-    match = re.search(r"/(?:reel|p|tv)/([^/?#&]+)", url)
-    return match.group(1) if match else None
-
-
-def _ensure_instaloader_setup() -> None:
-    global _INSTA_SETUP_DONE
-    if _INSTA_SETUP_DONE:
-        return
-
-    _INSTA_SETUP_DONE = True
-
-    proxy = os.getenv("INSTAGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-    if proxy:
-        try:
-            insta.context._session.proxies.update({"http": proxy, "https": proxy})
-            logger.info("Instaloader proxy configured")
-        except Exception:
-            logger.exception("Failed to configure Instaloader proxy")
-
-    username = os.getenv("INSTA_USERNAME")
-    password = os.getenv("INSTA_PASSWORD")
-    sessionfile = os.getenv("INSTA_SESSIONFILE")
-
-    if not username:
-        return
-
-    try:
-        if sessionfile and os.path.exists(sessionfile):
-            insta.load_session_from_file(username, sessionfile)
-            logger.info("Instaloader session loaded")
-            return
-    except Exception:
-        logger.exception("Failed to load Instaloader session")
-
-    if not password:
-        return
-
-    try:
-        insta.login(username, password)
-        logger.info("Instaloader login succeeded")
-        if sessionfile:
-            try:
-                insta.save_session_to_file(sessionfile)
-                logger.info("Instaloader session saved")
-            except Exception:
-                logger.exception("Failed to save Instaloader session")
-    except Exception:
-        logger.exception("Instaloader login failed")
-
 
 # ========== КОМАНДЫ БОТА ==========
 
@@ -258,58 +198,6 @@ def download_tiktok_ytdlp(url: str) -> str:
         return None
 
 
-def download_instagram_instaloader(url: str) -> str:
-    """Скачивание Instagram видео через Instaloader"""
-    temp_dir = None
-    try:
-        _ensure_instaloader_setup()
-
-        shortcode = _extract_instagram_shortcode(url)
-        if not shortcode:
-            return None
-
-        # Создаем временную папку
-        temp_dir = tempfile.mkdtemp()
-
-        # Скачиваем пост
-        post = instaloader.Post.from_shortcode(insta.context, shortcode)
-
-        # Скачиваем медиа (видео/фото)
-        insta.download_post(post, target=temp_dir)
-
-        # Ищем скачанный файл
-        media_file = None
-        for file in Path(temp_dir).rglob('*.mp4'):
-            media_file = file
-            break
-
-        if not media_file:
-            for pattern in ('*.jpg', '*.jpeg', '*.png', '*.webp'):
-                for file in Path(temp_dir).rglob(pattern):
-                    media_file = file
-                    break
-                if media_file:
-                    break
-
-        if not media_file:
-            return None
-
-        final_path = os.path.join(DOWNLOAD_FOLDER, clean_filename(media_file.name))
-        shutil.move(str(media_file), final_path)
-
-        return final_path if os.path.exists(final_path) else None
-
-    except Exception:
-        logger.exception("Error downloading Instagram with Instaloader")
-        return None
-    finally:
-        if temp_dir and os.path.isdir(temp_dir):
-            try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception:
-                pass
-
-
 def download_instagram_ytdlp(url: str) -> str:
     """Альтернативный способ для Instagram через yt-dlp"""
     proxy = os.getenv("INSTAGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
@@ -418,11 +306,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif 'instagram.com' in url:
             await status_msg.edit_text("⏳ Скачиваю Instagram медиа...")
 
-            # Пробуем разные методы для Instagram
-            filepath = download_instagram_instaloader(url)
-
-            if not filepath:
-                filepath = download_instagram_ytdlp(url)
+            filepath = download_instagram_ytdlp(url)
 
             if not filepath:
                 await status_msg.edit_text(
@@ -467,7 +351,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("❌ Не удалось скачать медиа. Попробуйте другую ссылку.")
 
     except Exception as e:
-        logger.error(f"Error in handle_message: {e}")
+        logger.exception("Error in handle_message")
         await status_msg.edit_text(f"❌ Произошла ошибка: {str(e)}")
 
     finally:
@@ -477,6 +361,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(filepath)
             except Exception:
                 pass
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = getattr(context, "error", None)
+    if err is None:
+        logger.exception("Unhandled exception in Telegram handler")
+        return
+
+    logger.error(
+        "Unhandled exception in Telegram handler: %s",
+        err,
+        exc_info=(type(err), err, err.__traceback__),
+    )
 
 
 # ========== ЗАПУСК БОТА ==========
@@ -500,6 +397,8 @@ def main():
 
     # Регистрируем обработчик текстовых сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    application.add_error_handler(error_handler)
 
     # Запускаем бота
     print("🤖 Бот запущен...")
