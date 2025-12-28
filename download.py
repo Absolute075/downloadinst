@@ -377,7 +377,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ext = ext.lower()
 
                 with open(path, 'rb') as media_file:
-                    if ext in [".jpg", ".jpeg", ".png", ".webp"]:
+                    if ext in [".jpg", ".jpeg", ".png"]:
                         await update.message.reply_photo(
                             photo=media_file,
                             caption="📷 Скачано через бота",
@@ -389,6 +389,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             supports_streaming=True
                         )
 
+            # После отправки очищаем скачанные файлы
+            for path in valid_paths:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
             await status_msg.delete()
 
         else:
@@ -397,21 +404,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Error in handle_message")
         await status_msg.edit_text(f"❌ Произошла ошибка: {str(e)}")
-
-    finally:
-        # Гарантированно удаляем временный файл(ы), если они были скачаны
-        paths_to_delete = []
-        if isinstance(filepath, list):
-            paths_to_delete = filepath
-        elif filepath:
-            paths_to_delete = [filepath]
-
-        for path in paths_to_delete:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
