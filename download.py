@@ -245,7 +245,7 @@ def download_instagram_ytdlp(url: str) -> str:
                     return
 
                 for f in base.iterdir():
-                    if f.suffix.lower() in [".mp4", ".jpg", ".jpeg", ".png", ".webp"]:
+                    if f.suffix.lower() in [".mp4", ".jpg", ".jpeg", ".png"]:
                         downloaded_files.append(str(f))
 
             _collect_files(info)
