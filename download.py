@@ -199,7 +199,7 @@ def download_tiktok_ytdlp(url: str) -> str:
 
 
 def download_instagram_ytdlp(url: str) -> str:
-    """Альтернативный способ для Instagram через yt-dlp"""
+    """Альтернативный способ для Instagram через yt-dlp (видео, фото, карусели)"""
     proxy = os.getenv("INSTAGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
     cookies_path = Path(os.getenv("INSTAGRAM_COOKIES_FILE") or "cookies.txt")
     ydl_opts = {
@@ -228,8 +228,44 @@ def download_instagram_ytdlp(url: str) -> str:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            return filename if os.path.exists(filename) else None
+
+            downloaded_files = []
+
+            def _collect_files(info_dict):
+                # Для карусели / плейлистов Instagram yt-dlp возвращает список entries
+                if isinstance(info_dict, dict) and info_dict.get('entries'):
+                    for entry in info_dict['entries']:
+                        _collect_files(entry)
+                    return
+
+                try:
+                    filename = ydl.prepare_filename(info_dict)
+                except Exception:
+                    return
+
+                if os.path.exists(filename):
+                    downloaded_files.append(filename)
+                    return
+
+                base_name, _ = os.path.splitext(filename)
+                for ext in ['.mp4', '.webm', '.mkv', '.jpg', '.jpeg', '.png', '.webp']:
+                    candidate = base_name + ext
+                    if os.path.exists(candidate):
+                        downloaded_files.append(candidate)
+                        break
+
+            _collect_files(info)
+
+            if not downloaded_files:
+                return None
+
+            # Если один файл – ведём себя как раньше, возвращая строку
+            if len(downloaded_files) == 1:
+                return downloaded_files[0]
+
+            # Если несколько – возвращаем список путей (карусель)
+            return downloaded_files
+
     except Exception as e:
         logger.exception("Error downloading Instagram with yt-dlp")
         err_str = str(e).lower()
@@ -289,6 +325,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Отправляем сообщение о начале загрузки
     status_msg = await update.message.reply_text("⏳ Скачиваю видео...")
     filepath = None
+    filepaths = []
 
     try:
         # Определяем платформу и выбираем метод скачивания
@@ -303,6 +340,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
+            filepaths = [filepath]
+
         elif 'instagram.com' in url:
             await status_msg.edit_text("⏳ Скачиваю Instagram медиа...")
 
@@ -315,35 +354,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-        if filepath and os.path.exists(filepath):
-            # Проверяем размер файла (Telegram ограничение: 50 МБ)
-            file_size = os.path.getsize(filepath) / (1024 * 1024)  # в МБ
+            if isinstance(filepath, list):
+                filepaths = [p for p in filepath if p]
+            else:
+                filepaths = [filepath]
 
-            if file_size > 50:
-                await status_msg.edit_text(
-                    f"❌ Файл слишком большой ({file_size:.1f} МБ). "
-                    f"Telegram ограничивает отправку 50 МБ."
-                )
-                return
+        valid_paths = [p for p in filepaths if p and os.path.exists(p)]
 
-            await status_msg.edit_text(f"✅ Медиа скачано! ({file_size:.1f} МБ)\n📤 Отправляю...")
+        if valid_paths:
+            # Проверяем размер файла (Telegram ограничение: 50 МБ) для каждого
+            for p in valid_paths:
+                file_size = os.path.getsize(p) / (1024 * 1024)  # в МБ
 
-            _, ext = os.path.splitext(filepath)
-            ext = ext.lower()
-
-            # Отправляем медиа
-            with open(filepath, 'rb') as media_file:
-                if ext in [".jpg", ".jpeg", ".png", ".webp"]:
-                    await update.message.reply_photo(
-                        photo=media_file,
-                        caption="📷 Скачано через бота",
+                if file_size > 50:
+                    await status_msg.edit_text(
+                        f"❌ Файл слишком большой ({file_size:.1f} МБ). "
+                        f"Telegram ограничивает отправку 50 МБ."
                     )
-                else:
-                    await update.message.reply_video(
-                        video=media_file,
-                        caption="🎬 Скачано через бота",
-                        supports_streaming=True
-                    )
+                    return
+
+            await status_msg.edit_text(
+                f"✅ Медиа скачано! ({len(valid_paths)} файл(ов))\n📤 Отправляю..."
+            )
+
+            # Отправляем все медиа (фото/видео)
+            for path in valid_paths:
+                _, ext = os.path.splitext(path)
+                ext = ext.lower()
+
+                with open(path, 'rb') as media_file:
+                    if ext in [".jpg", ".jpeg", ".png", ".webp"]:
+                        await update.message.reply_photo(
+                            photo=media_file,
+                            caption="📷 Скачано через бота",
+                        )
+                    else:
+                        await update.message.reply_video(
+                            video=media_file,
+                            caption="🎬 Скачано через бота",
+                            supports_streaming=True
+                        )
 
             await status_msg.delete()
 
@@ -355,12 +405,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Произошла ошибка: {str(e)}")
 
     finally:
-        # Гарантированно удаляем временный файл, если он был скачан
-        if filepath and os.path.exists(filepath):
-            try:
-                os.remove(filepath)
-            except Exception:
-                pass
+        # Гарантированно удаляем временный файл(ы), если они были скачаны
+        paths_to_delete = []
+        if isinstance(filepath, list):
+            paths_to_delete = filepath
+        elif filepath:
+            paths_to_delete = [filepath]
+
+        for path in paths_to_delete:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
