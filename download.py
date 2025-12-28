@@ -204,7 +204,7 @@ def download_instagram_ytdlp(url: str) -> str:
     cookies_path = Path(os.getenv("INSTAGRAM_COOKIES_FILE") or "cookies.txt")
     ydl_opts = {
         'format': 'best',
-        'outtmpl': f'{DOWNLOAD_FOLDER}/%(title)s.%(ext)s',
+        'outtmpl': f'{DOWNLOAD_FOLDER}/%(id)s/%(autonumber)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
@@ -232,27 +232,21 @@ def download_instagram_ytdlp(url: str) -> str:
             downloaded_files = []
 
             def _collect_files(info_dict):
-                # Для карусели / плейлистов Instagram yt-dlp возвращает список entries
-                if isinstance(info_dict, dict) and info_dict.get('entries'):
-                    for entry in info_dict['entries']:
+                if isinstance(info_dict, dict) and info_dict.get("entries"):
+                    for entry in info_dict["entries"]:
                         _collect_files(entry)
                     return
 
-                try:
-                    filename = ydl.prepare_filename(info_dict)
-                except Exception:
+                if not isinstance(info_dict, dict):
                     return
 
-                if os.path.exists(filename):
-                    downloaded_files.append(filename)
+                base = Path(DOWNLOAD_FOLDER) / info_dict.get("id", "")
+                if not base.exists():
                     return
 
-                base_name, _ = os.path.splitext(filename)
-                for ext in ['.mp4', '.webm', '.mkv', '.jpg', '.jpeg', '.png', '.webp']:
-                    candidate = base_name + ext
-                    if os.path.exists(candidate):
-                        downloaded_files.append(candidate)
-                        break
+                for f in base.iterdir():
+                    if f.suffix.lower() in [".mp4", ".jpg", ".jpeg", ".png", ".webp"]:
+                        downloaded_files.append(str(f))
 
             _collect_files(info)
 
