@@ -49,7 +49,11 @@ INSTAGRAM_COOLDOWN_SECONDS = int(os.getenv("INSTAGRAM_COOLDOWN_SECONDS", "30"))
 INSTAGRAM_MAX_CONCURRENT = int(os.getenv("INSTAGRAM_MAX_CONCURRENT", "1"))
 _instagram_semaphore = asyncio.Semaphore(max(1, INSTAGRAM_MAX_CONCURRENT))
 
-TELEGRAM_SEND_INSTAGRAM_IMAGES_AS_DOCUMENT = os.getenv("TELEGRAM_SEND_INSTAGRAM_IMAGES_AS_DOCUMENT", "1").strip() not in ("0", "false", "False")
+TELEGRAM_SEND_INSTAGRAM_IMAGES_AS_DOCUMENT = os.getenv("TELEGRAM_SEND_INSTAGRAM_IMAGES_AS_DOCUMENT", "0").strip() not in (
+    "0",
+    "false",
+    "False",
+)
 
 # ========== КОМАНДЫ БОТА ==========
 
@@ -199,46 +203,80 @@ def _extract_display_urls_from_html(page_url: str, cookiejar: http.cookiejar.Coo
 
     urls = []
 
-    # Prefer best display_resources src (usually full-size, not cropped thumbnail)
-    # Parse inside display_resources blocks to avoid picking unrelated images on the page.
-    best_src = None
-    best_score = -1
+    candidates: list[tuple[int, int, str]] = []
 
-    blocks = []
+    def _add_candidate(w: int, h: int, u: str):
+        u = _unescape_jsonish_url(u)
+        if not u.startswith("http"):
+            return
+        if not any(ext in u.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            return
+        candidates.append((w, h, u))
+
     for bm in re.finditer(r'"display_resources"\s*:\s*\[(.*?)\]', text, flags=re.DOTALL):
-        blocks.append(bm.group(1))
-    if not blocks:
-        blocks = [text]
-
-    for block in blocks:
-        for m in re.finditer(r'"config_width"\s*:\s*(\d+)\s*,\s*"config_height"\s*:\s*(\d+)\s*,\s*"src"\s*:\s*"([^"]+)"', block):
+        block = bm.group(1)
+        for m in re.finditer(
+            r'"config_width"\s*:\s*(\d+)\s*,\s*"config_height"\s*:\s*(\d+)\s*,\s*"src"\s*:\s*"([^"]+)"',
+            block,
+        ):
             try:
                 w = int(m.group(1))
                 h = int(m.group(2))
             except Exception:
                 continue
-            src = _unescape_jsonish_url(m.group(3))
-            if not src.startswith("http"):
-                continue
-            if not any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-                continue
-            score = w * h
-            if score > best_score:
-                best_score = score
-                best_src = src
+            _add_candidate(w, h, m.group(3))
 
-    if best_src:
-        urls.append(best_src)
+    for bm in re.finditer(r'"image_versions2"\s*:\s*\{.*?"candidates"\s*:\s*\[(.*?)\]', text, flags=re.DOTALL):
+        block = bm.group(1)
+        for m in re.finditer(r'"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)\s*,\s*"url"\s*:\s*"([^"]+)"', block):
+            try:
+                w = int(m.group(1))
+                h = int(m.group(2))
+            except Exception:
+                continue
+            _add_candidate(w, h, m.group(3))
+        for m in re.finditer(r'"url"\s*:\s*"([^"]+)"\s*,\s*"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)', block):
+            try:
+                w = int(m.group(2))
+                h = int(m.group(3))
+            except Exception:
+                continue
+            _add_candidate(w, h, m.group(1))
+
+    # Extra safety: sometimes candidates appear outside the narrow image_versions2 regex window.
+    # Skip anything that looks like cropped preview.
+    for m in re.finditer(r'"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)\s*,\s*"url"\s*:\s*"([^"]+)"', text):
+        try:
+            w = int(m.group(1))
+            h = int(m.group(2))
+        except Exception:
+            continue
+        ctx = text[max(0, m.start() - 200):m.start()].lower()
+        if "cropped" in ctx:
+            continue
+        _add_candidate(w, h, m.group(3))
+
+    for m in re.finditer(r'"url"\s*:\s*"([^"]+)"\s*,\s*"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)', text):
+        try:
+            w = int(m.group(2))
+            h = int(m.group(3))
+        except Exception:
+            continue
+        ctx = text[max(0, m.start() - 200):m.start()].lower()
+        if "cropped" in ctx:
+            continue
+        _add_candidate(w, h, m.group(1))
+
+    if candidates:
+        non_square = [c for c in candidates if abs(c[0] - c[1]) > 2]
+        pool = non_square or candidates
+        best = max(pool, key=lambda c: c[0] * c[1])
+        logger.info("IG best image candidate %sx%s %s", best[0], best[1], best[2][:160])
+        urls.append(best[2])
 
     for m in re.finditer(r'"display_url"\s*:\s*"([^"]+)"', text):
         u = _unescape_jsonish_url(m.group(1))
         if u.startswith("http"):
-            urls.append(u)
-
-    # Fallback: sometimes image URLs appear as plain "url":"https:\/\/...fbcdn..."
-    for m in re.finditer(r'"url"\s*:\s*"(https?:\\/\\/[^\"]+)"', text):
-        u = _unescape_jsonish_url(m.group(1))
-        if u.startswith("http") and any(ext in u.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
             urls.append(u)
 
     # de-dup preserving order
