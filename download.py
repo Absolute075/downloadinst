@@ -203,11 +203,15 @@ def _unescape_jsonish_url(s: str) -> str:
 def _extract_display_urls_from_html(page_url: str, cookiejar: http.cookiejar.CookieJar | None = None) -> list[str]:
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Referer': 'https://www.instagram.com/',
+        'X-IG-App-ID': os.getenv('INSTAGRAM_APP_ID', '936619743392459'),
     }
     response = requests.get(page_url, headers=headers, cookies=cookiejar, timeout=30)
     response.raise_for_status()
+    if isinstance(response.url, str) and any(x in response.url.lower() for x in ["/accounts/login", "/challenge/"]):
+        logger.info("IG html redirected to auth page: %s", response.url)
     text = response.text or ""
 
     urls = []
@@ -264,30 +268,49 @@ def _extract_display_urls_from_json_endpoint(
 ) -> list[str]:
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json,text/plain,*/*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Referer': 'https://www.instagram.com/',
+        'X-IG-App-ID': os.getenv('INSTAGRAM_APP_ID', '936619743392459'),
+        'X-Requested-With': 'XMLHttpRequest',
     }
 
     parsed = urlparse(page_url)
     q = dict(parse_qsl(parsed.query))
     q["__a"] = "1"
     q["__d"] = "dis"
-    api_url = urlunparse(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            urlencode(q),
-            parsed.fragment,
-        )
-    )
 
-    try:
-        r = requests.get(api_url, headers=headers, cookies=cookiejar, timeout=30)
-        r.raise_for_status()
-    except Exception as e:
-        logger.info("IG json endpoint failed: %s", str(e))
+    paths_to_try = [parsed.path]
+    if parsed.path.endswith('/'):
+        paths_to_try.append(parsed.path.rstrip('/'))
+    else:
+        paths_to_try.append(parsed.path + '/')
+
+    r = None
+    last_err = None
+    for p in paths_to_try:
+        api_url = urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                p,
+                parsed.params,
+                urlencode(q),
+                parsed.fragment,
+            )
+        )
+        try:
+            r = requests.get(api_url, headers=headers, cookies=cookiejar, timeout=30)
+            if isinstance(r.url, str) and any(x in r.url.lower() for x in ["/accounts/login", "/challenge/"]):
+                logger.info("IG json redirected to auth page: %s", r.url)
+            r.raise_for_status()
+            break
+        except Exception as e:
+            last_err = e
+            r = None
+
+    if r is None:
+        logger.info("IG json endpoint failed: %s", str(last_err))
         return []
 
     try:
@@ -520,6 +543,8 @@ def download_instagram_ytdlp(url: str) -> str:
 
     if cookies_path.is_file():
         ydl_opts['cookiefile'] = str(cookies_path)
+    else:
+        logger.info("IG cookies file not found: %s", str(cookies_path))
 
     cookiejar = _load_cookiejar(cookies_path) if cookies_path.is_file() else None
 
