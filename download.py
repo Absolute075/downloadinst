@@ -164,6 +164,13 @@ def clean_filename(filename: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_url(url: str) -> str:
+    url = (url or "").strip()
+    url = url.rstrip('.,);]>\'"')
+    url = url.split('#', 1)[0]
+    return url
+
+
 def download_tiktok_ytdlp(url: str) -> str:
     """Скачивание TikTok видео через yt-dlp"""
     proxy = os.getenv("TIKTOK_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
@@ -254,6 +261,7 @@ def download_instagram_ytdlp(url: str) -> str:
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            started_at = time.time()
             info = ydl.extract_info(url, download=True)
 
             downloaded_files = []
@@ -272,10 +280,24 @@ def download_instagram_ytdlp(url: str) -> str:
                     return
 
                 for f in base.iterdir():
-                    if f.suffix.lower() in [".mp4", ".jpg", ".jpeg", ".png"]:
+                    if f.suffix.lower() in [".mp4", ".jpg", ".jpeg", ".png", ".webp"]:
                         downloaded_files.append(str(f))
 
             _collect_files(info)
+
+            if not downloaded_files:
+                root = Path(DOWNLOAD_FOLDER)
+                if root.exists():
+                    for f in root.rglob('*'):
+                        try:
+                            if not f.is_file():
+                                continue
+                            if f.suffix.lower() not in [".mp4", ".jpg", ".jpeg", ".png", ".webp"]:
+                                continue
+                            if f.stat().st_mtime >= (started_at - 2):
+                                downloaded_files.append(str(f))
+                        except OSError:
+                            continue
 
             if not downloaded_files:
                 return None
@@ -341,7 +363,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    url = match.group(0)
+    url = _normalize_url(match.group(0))
 
     # Отправляем сообщение о начале загрузки
     status_msg = await update.message.reply_text("⏳ Скачиваю видео...")
