@@ -627,6 +627,30 @@ def download_instagram_ytdlp(url: str) -> str:
                         extracted_urls = []
 
                 if extracted_urls:
+                    is_carousel = False
+                    try:
+                        if isinstance(info, dict) and isinstance(info.get("entries"), list):
+                            is_carousel = len(info.get("entries") or []) > 1
+                    except Exception:
+                        is_carousel = False
+
+                    # Remove duplicates (HTML can contain many URLs for the same image at different sizes)
+                    seen_norm = set()
+                    deduped = []
+                    for u in extracted_urls:
+                        if not isinstance(u, str) or not u.startswith("http"):
+                            continue
+                        nu = _normalize_url(u)
+                        if nu in seen_norm:
+                            continue
+                        seen_norm.add(nu)
+                        deduped.append(u)
+                    extracted_urls = deduped
+
+                    # For single-photo posts, download only the best candidate
+                    if not is_carousel:
+                        extracted_urls = extracted_urls[:1]
+
                     base_id = None
                     if isinstance(info, dict):
                         base_id = info.get("id")
