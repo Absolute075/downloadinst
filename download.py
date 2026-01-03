@@ -176,6 +176,71 @@ def _normalize_url(url: str) -> str:
     return url
 
 
+def _unescape_jsonish_url(s: str) -> str:
+    s = (s or "").strip()
+    s = html.unescape(s)
+    s = s.replace('\\/', '/')
+    s = s.replace('\\u0026', '&')
+    s = s.replace('\\u003d', '=')
+    return s
+
+
+def _extract_display_urls_from_html(page_url: str, cookiejar: http.cookiejar.CookieJar | None = None) -> list[str]:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.instagram.com/',
+    }
+    response = requests.get(page_url, headers=headers, cookies=cookiejar, timeout=30)
+    response.raise_for_status()
+    text = response.text or ""
+
+    urls = []
+
+    # Prefer best display_resources src (usually full-size, not cropped thumbnail)
+    best_src = None
+    best_score = -1
+    for m in re.finditer(r'"config_width"\s*:\s*(\d+)\s*,\s*"config_height"\s*:\s*(\d+)\s*,\s*"src"\s*:\s*"([^"]+)"', text):
+        try:
+            w = int(m.group(1))
+            h = int(m.group(2))
+        except Exception:
+            continue
+        src = _unescape_jsonish_url(m.group(3))
+        if not src.startswith("http"):
+            continue
+        if not any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            continue
+        score = w * h
+        if score > best_score:
+            best_score = score
+            best_src = src
+
+    if best_src:
+        urls.append(best_src)
+
+    for m in re.finditer(r'"display_url"\s*:\s*"([^"]+)"', text):
+        u = _unescape_jsonish_url(m.group(1))
+        if u.startswith("http"):
+            urls.append(u)
+
+    # Fallback: sometimes image URLs appear as plain "url":"https:\/\/...fbcdn..."
+    for m in re.finditer(r'"url"\s*:\s*"(https?:\\/\\/[^\"]+)"', text):
+        u = _unescape_jsonish_url(m.group(1))
+        if u.startswith("http") and any(ext in u.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            urls.append(u)
+
+    # de-dup preserving order
+    seen = set()
+    out = []
+    for u in urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
 def _guess_ext_from_url(url: str) -> str:
     try:
         path = urlparse(url).path
@@ -391,20 +456,6 @@ def download_instagram_ytdlp(url: str) -> str:
             _collect_files(info)
 
             if not downloaded_files:
-                root = Path(DOWNLOAD_FOLDER)
-                if root.exists():
-                    for f in root.rglob('*'):
-                        try:
-                            if not f.is_file():
-                                continue
-                            if f.suffix.lower() not in [".mp4", ".jpg", ".jpeg", ".png", ".webp"]:
-                                continue
-                            if f.stat().st_mtime >= (started_at - 2):
-                                downloaded_files.append(str(f))
-                        except OSError:
-                            continue
-
-            if not downloaded_files:
                 image_urls = []
 
                 def _collect_image_urls(info_dict):
@@ -413,6 +464,35 @@ def download_instagram_ytdlp(url: str) -> str:
                             _collect_image_urls(entry)
                     if not isinstance(info_dict, dict):
                         return
+
+                    direct_url = info_dict.get("url")
+                    if isinstance(direct_url, str) and direct_url.startswith("http"):
+                        ext = _guess_ext_from_url(direct_url)
+                        if ext in [".jpg", ".jpeg", ".png", ".webp"]:
+                            image_urls.append(direct_url)
+
+                    fmts = info_dict.get("formats") or []
+                    if isinstance(fmts, list):
+                        best = None
+                        best_score = -1
+                        for f in fmts:
+                            if not isinstance(f, dict):
+                                continue
+                            u = f.get("url")
+                            if not isinstance(u, str) or not u.startswith("http"):
+                                continue
+                            vcodec = f.get("vcodec")
+                            if vcodec not in [None, "none"]:
+                                continue
+                            ext = (f.get("ext") or "").lower()
+                            if ext and ("." + ext) not in [".jpg", ".jpeg", ".png", ".webp"]:
+                                continue
+                            score = (f.get("width") or 0) * (f.get("height") or 0)
+                            if score > best_score:
+                                best = u
+                                best_score = score
+                        if best:
+                            image_urls.append(best)
 
                     thumbs = info_dict.get("thumbnails") or []
                     if isinstance(thumbs, list) and thumbs:
@@ -437,6 +517,22 @@ def download_instagram_ytdlp(url: str) -> str:
                         image_urls.append(thumb)
 
                 _collect_image_urls(info)
+
+                # Always try to prepend full-size URLs from page HTML (display_resources/display_url)
+                try:
+                    html_urls = _extract_display_urls_from_html(url, cookiejar)
+                except Exception:
+                    html_urls = []
+
+                if html_urls:
+                    seen = set()
+                    merged = []
+                    for u in (html_urls + image_urls):
+                        if u in seen:
+                            continue
+                        seen.add(u)
+                        merged.append(u)
+                    image_urls = merged
 
                 if image_urls:
                     base_id = None
