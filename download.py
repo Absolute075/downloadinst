@@ -49,6 +49,8 @@ INSTAGRAM_COOLDOWN_SECONDS = int(os.getenv("INSTAGRAM_COOLDOWN_SECONDS", "30"))
 INSTAGRAM_MAX_CONCURRENT = int(os.getenv("INSTAGRAM_MAX_CONCURRENT", "1"))
 _instagram_semaphore = asyncio.Semaphore(max(1, INSTAGRAM_MAX_CONCURRENT))
 
+TELEGRAM_SEND_INSTAGRAM_IMAGES_AS_DOCUMENT = os.getenv("TELEGRAM_SEND_INSTAGRAM_IMAGES_AS_DOCUMENT", "1").strip() not in ("0", "false", "False")
+
 # ========== КОМАНДЫ БОТА ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -198,23 +200,32 @@ def _extract_display_urls_from_html(page_url: str, cookiejar: http.cookiejar.Coo
     urls = []
 
     # Prefer best display_resources src (usually full-size, not cropped thumbnail)
+    # Parse inside display_resources blocks to avoid picking unrelated images on the page.
     best_src = None
     best_score = -1
-    for m in re.finditer(r'"config_width"\s*:\s*(\d+)\s*,\s*"config_height"\s*:\s*(\d+)\s*,\s*"src"\s*:\s*"([^"]+)"', text):
-        try:
-            w = int(m.group(1))
-            h = int(m.group(2))
-        except Exception:
-            continue
-        src = _unescape_jsonish_url(m.group(3))
-        if not src.startswith("http"):
-            continue
-        if not any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-            continue
-        score = w * h
-        if score > best_score:
-            best_score = score
-            best_src = src
+
+    blocks = []
+    for bm in re.finditer(r'"display_resources"\s*:\s*\[(.*?)\]', text, flags=re.DOTALL):
+        blocks.append(bm.group(1))
+    if not blocks:
+        blocks = [text]
+
+    for block in blocks:
+        for m in re.finditer(r'"config_width"\s*:\s*(\d+)\s*,\s*"config_height"\s*:\s*(\d+)\s*,\s*"src"\s*:\s*"([^"]+)"', block):
+            try:
+                w = int(m.group(1))
+                h = int(m.group(2))
+            except Exception:
+                continue
+            src = _unescape_jsonish_url(m.group(3))
+            if not src.startswith("http"):
+                continue
+            if not any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                continue
+            score = w * h
+            if score > best_score:
+                best_score = score
+                best_src = src
 
     if best_src:
         urls.append(best_src)
@@ -637,6 +648,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("⏳ Скачиваю видео...")
     filepath = None
     filepaths = []
+    is_instagram = False
 
     try:
         # Определяем платформу и выбираем метод скачивания
@@ -655,6 +667,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif 'instagram.com' in url:
             await status_msg.edit_text("⏳ Скачиваю Instagram медиа...")
+            is_instagram = True
 
             now = time.time()
             last_ig = float(context.user_data.get("ig_last_ts", 0) or 0)
@@ -706,7 +719,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ext = ext.lower()
 
                 with open(path, 'rb') as media_file:
-                    if ext in [".jpg", ".jpeg", ".png"]:
+                    if ext in [".jpg", ".jpeg", ".png", ".webp"] and is_instagram and TELEGRAM_SEND_INSTAGRAM_IMAGES_AS_DOCUMENT:
+                        await update.message.reply_document(
+                            document=media_file,
+                            filename=os.path.basename(path),
+                            caption="📎 Скачано через бота",
+                        )
+                    elif ext in [".jpg", ".jpeg", ".png"]:
                         await update.message.reply_photo(
                             photo=media_file,
                             caption="📷 Скачано через бота",
