@@ -443,6 +443,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             photo=media_file,
                             caption="📷 Скачано через бота",
                         )
+                    elif ext in [".webp"]:
+                        await update.message.reply_document(
+                            document=media_file,
+                            filename=os.path.basename(path),
+                            caption="📎 Скачано через бота",
+                        )
                     else:
                         await update.message.reply_video(
                             video=media_file,
