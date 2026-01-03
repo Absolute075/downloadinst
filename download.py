@@ -1,6 +1,9 @@
 import os
 import re
 import logging
+import time
+import random
+import asyncio
 
 from pathlib import Path
 
@@ -37,6 +40,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Please set it in .env or as an environment variable.")
+
+INSTAGRAM_COOLDOWN_SECONDS = int(os.getenv("INSTAGRAM_COOLDOWN_SECONDS", "30"))
+INSTAGRAM_MAX_CONCURRENT = int(os.getenv("INSTAGRAM_MAX_CONCURRENT", "1"))
+_instagram_semaphore = asyncio.Semaphore(max(1, INSTAGRAM_MAX_CONCURRENT))
 
 # ========== КОМАНДЫ БОТА ==========
 
@@ -202,6 +209,19 @@ def download_instagram_ytdlp(url: str) -> str:
     """Альтернативный способ для Instagram через yt-dlp (видео, фото, карусели)"""
     proxy = os.getenv("INSTAGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
     cookies_path = Path(os.getenv("INSTAGRAM_COOKIES_FILE") or "cookies.txt")
+
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    ]
+    ua = random.choice(user_agents)
+
+    ratelimit = os.getenv("INSTAGRAM_RATELIMIT")
+    ratelimit = int(ratelimit) if ratelimit and ratelimit.isdigit() else 0
+
+    sleep_interval = float(os.getenv("INSTAGRAM_SLEEP_INTERVAL", "1.0"))
+    max_sleep_interval = float(os.getenv("INSTAGRAM_MAX_SLEEP_INTERVAL", "3.0"))
     ydl_opts = {
         'format': 'best',
         'outtmpl': f'{DOWNLOAD_FOLDER}/%(id)s/%(autonumber)s.%(ext)s',
@@ -209,15 +229,22 @@ def download_instagram_ytdlp(url: str) -> str:
         'no_warnings': True,
         'extract_flat': False,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': ua,
             'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.instagram.com/',
         },
         # Делаем скачивание более устойчивым
         'socket_timeout': 120,
         'retries': 5,
         'fragment_retries': 5,
         'extractor_retries': 5,
+        'concurrent_fragment_downloads': 1,
+        'sleep_interval': max(0.0, sleep_interval),
+        'max_sleep_interval': max(0.0, max_sleep_interval),
     }
+
+    if ratelimit > 0:
+        ydl_opts['ratelimit'] = ratelimit
 
     if proxy:
         ydl_opts['proxy'] = proxy
@@ -325,7 +352,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Определяем платформу и выбираем метод скачивания
         if 'tiktok.com' in url:
             await status_msg.edit_text("⏳ Скачиваю TikTok видео...")
-            filepath = download_tiktok_ytdlp(url)
+            filepath = await asyncio.to_thread(download_tiktok_ytdlp, url)
 
             if not filepath:
                 await status_msg.edit_text(
@@ -339,7 +366,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif 'instagram.com' in url:
             await status_msg.edit_text("⏳ Скачиваю Instagram медиа...")
 
-            filepath = download_instagram_ytdlp(url)
+            now = time.time()
+            last_ig = float(context.user_data.get("ig_last_ts", 0) or 0)
+            remaining = INSTAGRAM_COOLDOWN_SECONDS - (now - last_ig)
+            if remaining > 0:
+                await status_msg.edit_text(
+                    f"⏳ Подождите {int(remaining)} сек перед следующим скачиванием из Instagram."
+                )
+                return
+
+            context.user_data["ig_last_ts"] = now
+
+            async with _instagram_semaphore:
+                filepath = await asyncio.to_thread(download_instagram_ytdlp, url)
 
             if not filepath:
                 await status_msg.edit_text(
