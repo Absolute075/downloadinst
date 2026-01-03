@@ -167,8 +167,38 @@ def clean_filename(filename: str) -> str:
 def _normalize_url(url: str) -> str:
     url = (url or "").strip()
     url = url.rstrip('.,);]>\'"')
+    url = url.split('?', 1)[0]
     url = url.split('#', 1)[0]
     return url
+
+
+def _guess_ext_from_url(url: str) -> str:
+    try:
+        path = urlparse(url).path
+        ext = os.path.splitext(path)[1].lower()
+        if ext in [".jpg", ".jpeg", ".png", ".webp"]:
+            return ext
+    except Exception:
+        pass
+    return ".jpg"
+
+
+def _download_binary_to_file(url: str, filepath: str) -> str:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.instagram.com/',
+    }
+    response = requests.get(url, headers=headers, stream=True, timeout=60)
+    response.raise_for_status()
+
+    Path(os.path.dirname(filepath)).mkdir(parents=True, exist_ok=True)
+    with open(filepath, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+
+    return filepath if os.path.exists(filepath) else None
 
 
 def download_tiktok_ytdlp(url: str) -> str:
@@ -235,6 +265,7 @@ def download_instagram_ytdlp(url: str) -> str:
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
+        'ignore_no_formats_error': True,
         'http_headers': {
             'User-Agent': ua,
             'Accept-Language': 'en-US,en;q=0.9',
@@ -297,6 +328,56 @@ def download_instagram_ytdlp(url: str) -> str:
                             if f.stat().st_mtime >= (started_at - 2):
                                 downloaded_files.append(str(f))
                         except OSError:
+                            continue
+
+            if not downloaded_files:
+                image_urls = []
+
+                def _collect_image_urls(info_dict):
+                    if isinstance(info_dict, dict) and info_dict.get("entries"):
+                        for entry in info_dict["entries"]:
+                            _collect_image_urls(entry)
+                        return
+                    if not isinstance(info_dict, dict):
+                        return
+
+                    thumbs = info_dict.get("thumbnails") or []
+                    if isinstance(thumbs, list) and thumbs:
+                        best = None
+                        best_score = -1
+                        for t in thumbs:
+                            if not isinstance(t, dict):
+                                continue
+                            u = t.get("url")
+                            if not u:
+                                continue
+                            score = (t.get("width") or 0) * (t.get("height") or 0)
+                            if score > best_score:
+                                best = u
+                                best_score = score
+                        if best:
+                            image_urls.append(best)
+                            return
+
+                    thumb = info_dict.get("thumbnail")
+                    if isinstance(thumb, str) and thumb:
+                        image_urls.append(thumb)
+
+                _collect_image_urls(info)
+
+                if image_urls:
+                    base_id = None
+                    if isinstance(info, dict):
+                        base_id = info.get("id")
+                    base_dir = Path(DOWNLOAD_FOLDER) / (base_id or "ig")
+                    for idx, u in enumerate(image_urls[:10], start=1):
+                        ext = _guess_ext_from_url(u)
+                        out = str(base_dir / f"fallback_{idx}{ext}")
+                        try:
+                            fp = _download_binary_to_file(u, out)
+                            if fp:
+                                downloaded_files.append(fp)
+                        except Exception:
                             continue
 
             if not downloaded_files:
