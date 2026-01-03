@@ -212,84 +212,38 @@ def _extract_display_urls_from_html(page_url: str, cookiejar: http.cookiejar.Coo
 
     urls = []
 
-    candidates: list[tuple[int, int, str]] = []
-
-    def _add_candidate(w: int, h: int, u: str):
-        u = _unescape_jsonish_url(u)
-        if not u.startswith("http"):
-            return
-        if not any(ext in u.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-            return
-        candidates.append((w, h, u))
-
-    for bm in re.finditer(r'"display_resources"\s*:\s*\[(.*?)\]', text, flags=re.DOTALL):
-        block = bm.group(1)
-        for m in re.finditer(
-            r'"config_width"\s*:\s*(\d+)\s*,\s*"config_height"\s*:\s*(\d+)\s*,\s*"src"\s*:\s*"([^"]+)"',
-            block,
-        ):
-            try:
-                w = int(m.group(1))
-                h = int(m.group(2))
-            except Exception:
-                continue
-            _add_candidate(w, h, m.group(3))
-
-    for bm in re.finditer(r'"image_versions2"\s*:\s*\{.*?"candidates"\s*:\s*\[(.*?)\]', text, flags=re.DOTALL):
-        block = bm.group(1)
-        for m in re.finditer(r'"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)\s*,\s*"url"\s*:\s*"([^"]+)"', block):
-            try:
-                w = int(m.group(1))
-                h = int(m.group(2))
-            except Exception:
-                continue
-            _add_candidate(w, h, m.group(3))
-        for m in re.finditer(r'"url"\s*:\s*"([^"]+)"\s*,\s*"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)', block):
-            try:
-                w = int(m.group(2))
-                h = int(m.group(3))
-            except Exception:
-                continue
-            _add_candidate(w, h, m.group(1))
-
-    # Extra safety: sometimes candidates appear outside the narrow image_versions2 regex window.
-    # Skip anything that looks like cropped preview.
-    for m in re.finditer(r'"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)\s*,\s*"url"\s*:\s*"([^"]+)"', text):
+    # Prefer best display_resources src (usually full-size, not cropped thumbnail)
+    best_src = None
+    best_score = -1
+    for m in re.finditer(r'"config_width"\s*:\s*(\d+)\s*,\s*"config_height"\s*:\s*(\d+)\s*,\s*"src"\s*:\s*"([^"]+)"', text):
         try:
             w = int(m.group(1))
             h = int(m.group(2))
         except Exception:
             continue
-        ctx = text[max(0, m.start() - 200):m.start()].lower()
-        if "cropped" in ctx:
+        src = _unescape_jsonish_url(m.group(3))
+        if not src.startswith("http"):
             continue
-        _add_candidate(w, h, m.group(3))
+        if not any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            continue
+        score = w * h
+        if score > best_score:
+            best_score = score
+            best_src = src
 
-    for m in re.finditer(r'"url"\s*:\s*"([^"]+)"\s*,\s*"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)', text):
-        try:
-            w = int(m.group(2))
-            h = int(m.group(3))
-        except Exception:
-            continue
-        ctx = text[max(0, m.start() - 200):m.start()].lower()
-        if "cropped" in ctx:
-            continue
-        _add_candidate(w, h, m.group(1))
-
-    if candidates:
-        non_square = [c for c in candidates if abs(c[0] - c[1]) > 2]
-        pool = non_square or candidates
-        best = max(pool, key=lambda c: c[0] * c[1])
-        logger.info("IG best image candidate %sx%s %s", best[0], best[1], best[2][:160])
-        urls.append(best[2])
+    if best_src:
+        urls.append(best_src)
 
     for m in re.finditer(r'"display_url"\s*:\s*"([^"]+)"', text):
         u = _unescape_jsonish_url(m.group(1))
         if u.startswith("http"):
             urls.append(u)
 
-    if not candidates and not urls:
-        logger.info("IG html parse: no image candidates found")
+    # Fallback: sometimes image URLs appear as plain "url":"https:\/\/...fbcdn..."
+    for m in re.finditer(r'"url"\s*:\s*"(https?:\\/\\/[^\"]+)"', text):
+        u = _unescape_jsonish_url(m.group(1))
+        if u.startswith("http") and any(ext in u.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            urls.append(u)
 
     # de-dup preserving order
     seen = set()
@@ -299,6 +253,8 @@ def _extract_display_urls_from_html(page_url: str, cookiejar: http.cookiejar.Coo
             continue
         seen.add(u)
         out.append(u)
+    if not out:
+        logger.info("IG html parse: no image candidates found")
     return out
 
 
@@ -328,27 +284,25 @@ def _extract_display_urls_from_json_endpoint(
     )
 
     try:
-        response = requests.get(api_url, headers=headers, cookies=cookiejar, timeout=30)
-        response.raise_for_status()
-    except Exception:
+        r = requests.get(api_url, headers=headers, cookies=cookiejar, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        logger.info("IG json endpoint failed: %s", str(e))
         return []
 
     try:
-        data = response.json()
+        data = r.json()
     except Exception:
         try:
-            data = json.loads(response.text)
+            data = json.loads(r.text)
         except Exception:
             return []
 
     candidates: list[tuple[int, int, str]] = []
-    urls: list[str] = []
 
     def _add_candidate(w: int, h: int, u: str):
         u = _unescape_jsonish_url(u)
-        if not u.startswith("http"):
-            return
-        if not any(ext in u.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+        if not isinstance(u, str) or not u.startswith("http"):
             return
         candidates.append((w, h, u))
 
@@ -356,22 +310,15 @@ def _extract_display_urls_from_json_endpoint(
         if isinstance(obj, dict):
             for k, v in obj.items():
                 _walk(v, path + [str(k)])
-
-            du = obj.get("display_url")
-            if isinstance(du, str) and du.startswith("http"):
-                urls.append(du)
-
             cand = obj.get("candidates")
             if isinstance(cand, list) and "cropped" not in "/".join(path).lower():
                 for item in cand:
                     if not isinstance(item, dict):
                         continue
                     u = item.get("url")
-                    if not isinstance(u, str):
-                        continue
                     w = item.get("width")
                     h = item.get("height")
-                    if isinstance(w, int) and isinstance(h, int):
+                    if isinstance(u, str) and isinstance(w, int) and isinstance(h, int):
                         _add_candidate(w, h, u)
         elif isinstance(obj, list):
             for it in obj:
@@ -379,26 +326,15 @@ def _extract_display_urls_from_json_endpoint(
 
     _walk(data, [])
 
-    out: list[str] = []
-    if candidates:
-        non_square = [c for c in candidates if abs(c[0] - c[1]) > 2]
-        pool = non_square or candidates
-        best = max(pool, key=lambda c: c[0] * c[1])
-        logger.info("IG json best image candidate %sx%s %s", best[0], best[1], best[2][:160])
-        out.append(best[2])
-
-    out.extend(urls)
-
-    seen = set()
-    dedup = []
-    for u in out:
-        if u in seen:
-            continue
-        seen.add(u)
-        dedup.append(u)
-    if not dedup:
+    if not candidates:
         logger.info("IG json parse: no image candidates found")
-    return dedup
+        return []
+
+    non_square = [c for c in candidates if abs(c[0] - c[1]) > 2]
+    pool = non_square or candidates
+    best = max(pool, key=lambda c: c[0] * c[1])
+    logger.info("IG json best image candidate %sx%s %s", best[0], best[1], best[2][:160])
+    return [best[2]]
 
 
 def _guess_ext_from_url(url: str) -> str:
@@ -427,16 +363,37 @@ def _download_binary_to_file(url: str, filepath: str, cookiejar: http.cookiejar.
         'Accept-Language': 'en-US,en;q=0.9',
         'Referer': 'https://www.instagram.com/',
     }
-    response = requests.get(url, headers=headers, cookies=cookiejar, stream=True, timeout=60)
-    response.raise_for_status()
-
     Path(os.path.dirname(filepath)).mkdir(parents=True, exist_ok=True)
-    with open(filepath, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
 
-    return filepath if os.path.exists(filepath) else None
+    for _attempt in range(3):
+        response = requests.get(url, headers=headers, cookies=cookiejar, timeout=60)
+        response.raise_for_status()
+        content = response.content or b""
+        if not content:
+            continue
+
+        with open(filepath, 'wb') as f:
+            f.write(content)
+
+        try:
+            expected = response.headers.get("Content-Length")
+            if expected and expected.isdigit():
+                actual = os.path.getsize(filepath)
+                if actual != int(expected):
+                    continue
+
+            if _PIL_AVAILABLE:
+                try:
+                    with Image.open(filepath) as im:
+                        im.verify()
+                except Exception:
+                    continue
+
+            return filepath if os.path.exists(filepath) else None
+        except Exception:
+            continue
+
+    return None
 
 
 def _convert_to_jpeg_if_possible(filepath: str) -> str | None:
@@ -632,26 +589,27 @@ def download_instagram_ytdlp(url: str) -> str:
             _collect_files(info)
 
             if not has_video_formats:
+                extracted_urls = []
                 try:
-                    html_urls = _extract_display_urls_from_json_endpoint(url, cookiejar)
+                    extracted_urls = _extract_display_urls_from_json_endpoint(url, cookiejar)
                 except Exception:
-                    html_urls = []
+                    extracted_urls = []
 
-                if not html_urls:
+                if not extracted_urls:
                     try:
-                        html_urls = _extract_display_urls_from_html(url, cookiejar)
+                        extracted_urls = _extract_display_urls_from_html(url, cookiejar)
                     except Exception:
-                        html_urls = []
+                        extracted_urls = []
 
-                if html_urls:
+                if extracted_urls:
                     base_id = None
                     if isinstance(info, dict):
                         base_id = info.get("id")
                     base_dir = Path(DOWNLOAD_FOLDER) / (base_id or "ig")
                     preferred = []
-                    for idx, u in enumerate(html_urls[:10], start=1):
+                    for idx, u in enumerate(extracted_urls[:10], start=1):
                         ext = _guess_ext_from_url(u)
-                        out = str(base_dir / f"html_{idx}{ext}")
+                        out = str(base_dir / f"full_{idx}{ext}")
                         try:
                             fp = _download_binary_to_file(u, out, cookiejar)
                             if fp:
@@ -660,9 +618,12 @@ def download_instagram_ytdlp(url: str) -> str:
                             continue
 
                     if preferred:
+                        for p in list(downloaded_files):
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
                         downloaded_files = preferred
-                else:
-                    logger.info("IG: no html/json full-size URLs extracted")
 
             if not downloaded_files:
                 image_urls = []
