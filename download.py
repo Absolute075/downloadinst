@@ -4,6 +4,8 @@ import logging
 import time
 import random
 import asyncio
+import html
+import http.cookiejar
 
 from pathlib import Path
 
@@ -12,6 +14,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 
 import yt_dlp
 import requests
+
+from yt_dlp.utils import DownloadError
 
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -183,13 +187,22 @@ def _guess_ext_from_url(url: str) -> str:
     return ".jpg"
 
 
-def _download_binary_to_file(url: str, filepath: str) -> str:
+def _load_cookiejar(cookies_path: Path) -> http.cookiejar.MozillaCookieJar | None:
+    try:
+        jar = http.cookiejar.MozillaCookieJar()
+        jar.load(str(cookies_path), ignore_discard=True, ignore_expires=True)
+        return jar
+    except Exception:
+        return None
+
+
+def _download_binary_to_file(url: str, filepath: str, cookiejar: http.cookiejar.CookieJar | None = None) -> str:
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
         'Referer': 'https://www.instagram.com/',
     }
-    response = requests.get(url, headers=headers, stream=True, timeout=60)
+    response = requests.get(url, headers=headers, cookies=cookiejar, stream=True, timeout=60)
     response.raise_for_status()
 
     Path(os.path.dirname(filepath)).mkdir(parents=True, exist_ok=True)
@@ -199,6 +212,26 @@ def _download_binary_to_file(url: str, filepath: str) -> str:
                 f.write(chunk)
 
     return filepath if os.path.exists(filepath) else None
+
+
+def _extract_og_media_urls(page_url: str, cookiejar: http.cookiejar.CookieJar | None = None) -> list[str]:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.instagram.com/',
+    }
+    response = requests.get(page_url, headers=headers, cookies=cookiejar, timeout=30)
+    response.raise_for_status()
+    text = response.text or ""
+
+    urls = []
+    for prop in ["og:video", "og:image"]:
+        m = re.search(rf'property="{re.escape(prop)}"\s+content="([^"]+)"', text)
+        if m:
+            u = html.unescape(m.group(1)).strip()
+            if u:
+                urls.append(u)
+    return urls
 
 
 def download_tiktok_ytdlp(url: str) -> str:
@@ -290,10 +323,53 @@ def download_instagram_ytdlp(url: str) -> str:
     if cookies_path.is_file():
         ydl_opts['cookiefile'] = str(cookies_path)
 
+    cookiejar = _load_cookiejar(cookies_path) if cookies_path.is_file() else None
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             started_at = time.time()
-            info = ydl.extract_info(url, download=True)
+            info = None
+            try:
+                info = ydl.extract_info(url, download=False)
+            except Exception:
+                info = None
+
+            has_video_formats = False
+
+            def _probe_formats(info_dict):
+                nonlocal has_video_formats
+                if has_video_formats:
+                    return
+                if isinstance(info_dict, dict) and info_dict.get("entries"):
+                    for entry in info_dict["entries"]:
+                        _probe_formats(entry)
+                    return
+                if not isinstance(info_dict, dict):
+                    return
+                fmts = info_dict.get("formats") or []
+                if not isinstance(fmts, list) or not fmts:
+                    return
+
+                for f in fmts:
+                    if not isinstance(f, dict):
+                        continue
+                    vcodec = f.get("vcodec")
+                    ext = (f.get("ext") or "").lower()
+                    if vcodec and vcodec != "none":
+                        has_video_formats = True
+                        return
+                    if ext in ["mp4", "webm", "mkv"] and vcodec and vcodec != "none":
+                        has_video_formats = True
+                        return
+
+            _probe_formats(info)
+
+            if has_video_formats:
+                try:
+                    info = ydl.extract_info(url, download=True)
+                except DownloadError as e:
+                    if "no video formats found" not in str(e).lower():
+                        raise
 
             downloaded_files = []
 
@@ -301,8 +377,6 @@ def download_instagram_ytdlp(url: str) -> str:
                 if isinstance(info_dict, dict) and info_dict.get("entries"):
                     for entry in info_dict["entries"]:
                         _collect_files(entry)
-                    return
-
                 if not isinstance(info_dict, dict):
                     return
 
@@ -337,7 +411,6 @@ def download_instagram_ytdlp(url: str) -> str:
                     if isinstance(info_dict, dict) and info_dict.get("entries"):
                         for entry in info_dict["entries"]:
                             _collect_image_urls(entry)
-                        return
                     if not isinstance(info_dict, dict):
                         return
 
@@ -374,7 +447,25 @@ def download_instagram_ytdlp(url: str) -> str:
                         ext = _guess_ext_from_url(u)
                         out = str(base_dir / f"fallback_{idx}{ext}")
                         try:
-                            fp = _download_binary_to_file(u, out)
+                            fp = _download_binary_to_file(u, out, cookiejar)
+                            if fp:
+                                downloaded_files.append(fp)
+                        except Exception:
+                            continue
+
+            if not downloaded_files:
+                try:
+                    og_urls = _extract_og_media_urls(url, cookiejar)
+                except Exception:
+                    og_urls = []
+
+                if og_urls:
+                    base_dir = Path(DOWNLOAD_FOLDER) / "ig"
+                    for idx, u in enumerate(og_urls[:5], start=1):
+                        ext = _guess_ext_from_url(u)
+                        out = str(base_dir / f"og_{idx}{ext}")
+                        try:
+                            fp = _download_binary_to_file(u, out, cookiejar)
                             if fp:
                                 downloaded_files.append(fp)
                         except Exception:
