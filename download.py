@@ -6,6 +6,7 @@ import random
 import asyncio
 import html
 import http.cookiejar
+import json
 
 from pathlib import Path
 
@@ -17,7 +18,15 @@ import requests
 
 from yt_dlp.utils import DownloadError
 
-from urllib.parse import urlparse
+try:
+    from PIL import Image
+
+    _PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    _PIL_AVAILABLE = False
+
+from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 from dotenv import load_dotenv
 
 # Настройка логирования
@@ -279,6 +288,9 @@ def _extract_display_urls_from_html(page_url: str, cookiejar: http.cookiejar.Coo
         if u.startswith("http"):
             urls.append(u)
 
+    if not candidates and not urls:
+        logger.info("IG html parse: no image candidates found")
+
     # de-dup preserving order
     seen = set()
     out = []
@@ -288,6 +300,105 @@ def _extract_display_urls_from_html(page_url: str, cookiejar: http.cookiejar.Coo
         seen.add(u)
         out.append(u)
     return out
+
+
+def _extract_display_urls_from_json_endpoint(
+    page_url: str,
+    cookiejar: http.cookiejar.CookieJar | None = None,
+) -> list[str]:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.instagram.com/',
+    }
+
+    parsed = urlparse(page_url)
+    q = dict(parse_qsl(parsed.query))
+    q["__a"] = "1"
+    q["__d"] = "dis"
+    api_url = urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(q),
+            parsed.fragment,
+        )
+    )
+
+    try:
+        response = requests.get(api_url, headers=headers, cookies=cookiejar, timeout=30)
+        response.raise_for_status()
+    except Exception:
+        return []
+
+    try:
+        data = response.json()
+    except Exception:
+        try:
+            data = json.loads(response.text)
+        except Exception:
+            return []
+
+    candidates: list[tuple[int, int, str]] = []
+    urls: list[str] = []
+
+    def _add_candidate(w: int, h: int, u: str):
+        u = _unescape_jsonish_url(u)
+        if not u.startswith("http"):
+            return
+        if not any(ext in u.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            return
+        candidates.append((w, h, u))
+
+    def _walk(obj, path: list[str]):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _walk(v, path + [str(k)])
+
+            du = obj.get("display_url")
+            if isinstance(du, str) and du.startswith("http"):
+                urls.append(du)
+
+            cand = obj.get("candidates")
+            if isinstance(cand, list) and "cropped" not in "/".join(path).lower():
+                for item in cand:
+                    if not isinstance(item, dict):
+                        continue
+                    u = item.get("url")
+                    if not isinstance(u, str):
+                        continue
+                    w = item.get("width")
+                    h = item.get("height")
+                    if isinstance(w, int) and isinstance(h, int):
+                        _add_candidate(w, h, u)
+        elif isinstance(obj, list):
+            for it in obj:
+                _walk(it, path)
+
+    _walk(data, [])
+
+    out: list[str] = []
+    if candidates:
+        non_square = [c for c in candidates if abs(c[0] - c[1]) > 2]
+        pool = non_square or candidates
+        best = max(pool, key=lambda c: c[0] * c[1])
+        logger.info("IG json best image candidate %sx%s %s", best[0], best[1], best[2][:160])
+        out.append(best[2])
+
+    out.extend(urls)
+
+    seen = set()
+    dedup = []
+    for u in out:
+        if u in seen:
+            continue
+        seen.add(u)
+        dedup.append(u)
+    if not dedup:
+        logger.info("IG json parse: no image candidates found")
+    return dedup
 
 
 def _guess_ext_from_url(url: str) -> str:
@@ -326,6 +437,22 @@ def _download_binary_to_file(url: str, filepath: str, cookiejar: http.cookiejar.
                 f.write(chunk)
 
     return filepath if os.path.exists(filepath) else None
+
+
+def _convert_to_jpeg_if_possible(filepath: str) -> str | None:
+    if not filepath or not os.path.exists(filepath):
+        return None
+    if not _PIL_AVAILABLE:
+        return None
+    try:
+        root, _ = os.path.splitext(filepath)
+        out = root + ".jpg"
+        with Image.open(filepath) as im:
+            im = im.convert("RGB")
+            im.save(out, format="JPEG", quality=95, optimize=True)
+        return out if os.path.exists(out) else None
+    except Exception:
+        return None
 
 
 def _extract_og_media_urls(page_url: str, cookiejar: http.cookiejar.CookieJar | None = None) -> list[str]:
@@ -503,6 +630,39 @@ def download_instagram_ytdlp(url: str) -> str:
                         downloaded_files.append(str(f))
 
             _collect_files(info)
+
+            if not has_video_formats:
+                try:
+                    html_urls = _extract_display_urls_from_json_endpoint(url, cookiejar)
+                except Exception:
+                    html_urls = []
+
+                if not html_urls:
+                    try:
+                        html_urls = _extract_display_urls_from_html(url, cookiejar)
+                    except Exception:
+                        html_urls = []
+
+                if html_urls:
+                    base_id = None
+                    if isinstance(info, dict):
+                        base_id = info.get("id")
+                    base_dir = Path(DOWNLOAD_FOLDER) / (base_id or "ig")
+                    preferred = []
+                    for idx, u in enumerate(html_urls[:10], start=1):
+                        ext = _guess_ext_from_url(u)
+                        out = str(base_dir / f"html_{idx}{ext}")
+                        try:
+                            fp = _download_binary_to_file(u, out, cookiejar)
+                            if fp:
+                                preferred.append(fp)
+                        except Exception:
+                            continue
+
+                    if preferred:
+                        downloaded_files = preferred
+                else:
+                    logger.info("IG: no html/json full-size URLs extracted")
 
             if not downloaded_files:
                 image_urls = []
@@ -751,27 +911,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ Медиа скачано! ({len(valid_paths)} файл(ов))\n📤 Отправляю..."
             )
 
+            cleanup_paths = set(valid_paths)
+
             # Отправляем все медиа (фото/видео)
             for path in valid_paths:
                 _, ext = os.path.splitext(path)
                 ext = ext.lower()
 
-                with open(path, 'rb') as media_file:
-                    if ext in [".jpg", ".jpeg", ".png", ".webp"] and is_instagram and TELEGRAM_SEND_INSTAGRAM_IMAGES_AS_DOCUMENT:
+                send_path = path
+                send_ext = ext
+
+                if is_instagram and (not TELEGRAM_SEND_INSTAGRAM_IMAGES_AS_DOCUMENT) and ext == ".webp":
+                    converted = _convert_to_jpeg_if_possible(path)
+                    if converted:
+                        send_path = converted
+                        send_ext = ".jpg"
+                        cleanup_paths.add(converted)
+
+                with open(send_path, 'rb') as media_file:
+                    if is_instagram and TELEGRAM_SEND_INSTAGRAM_IMAGES_AS_DOCUMENT and send_ext in [".jpg", ".jpeg", ".png", ".webp"]:
                         await update.message.reply_document(
                             document=media_file,
-                            filename=os.path.basename(path),
+                            filename=os.path.basename(send_path),
                             caption="📎 Скачано через бота",
                         )
-                    elif ext in [".jpg", ".jpeg", ".png"]:
+                    elif send_ext in [".jpg", ".jpeg", ".png"]:
                         await update.message.reply_photo(
                             photo=media_file,
                             caption="📷 Скачано через бота",
                         )
-                    elif ext in [".webp"]:
+                    elif send_ext in [".webp"]:
                         await update.message.reply_document(
                             document=media_file,
-                            filename=os.path.basename(path),
+                            filename=os.path.basename(send_path),
                             caption="📎 Скачано через бота",
                         )
                     else:
@@ -782,7 +954,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
 
             # После отправки очищаем скачанные файлы
-            for path in valid_paths:
+            for path in cleanup_paths:
                 try:
                     os.remove(path)
                 except Exception:
